@@ -1,0 +1,13 @@
+# Never commit keys, secrets or environment files
+*.pem
+*.key
+id_*
+jenkins-deploy
+jenkins-deploy.pub
+ci-lab
+ci-lab.pub
+.env
+
+# Build output
+build/
+release.tgz

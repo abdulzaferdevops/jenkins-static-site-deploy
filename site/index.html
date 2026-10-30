@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Static Site CI/CD on OCI</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Lab 1 · jenkins-static-site-deploy</p>
+    <h1>Static site CI/CD on OCI</h1>
+    <p class="lead">This page was deployed by a Jenkins pipeline: GitHub push, webhook,
+      validate, package, atomic release switch, then a live check with automatic rollback.</p>
+
+    <section class="card">
+      <h2>Live release</h2>
+      <pre id="build">loading…</pre>
+    </section>
+
+    <section class="card">
+      <h2>Pipeline</h2>
+      <ol class="flow">
+        <li>GitHub push</li>
+        <li>Webhook → Jenkins</li>
+        <li>Validate</li>
+        <li>Package</li>
+        <li>Upload release</li>
+        <li>Switch <code>current</code></li>
+        <li>Verify or roll back</li>
+      </ol>
+    </section>
+  </main>
+
+  <script>
+    fetch('BUILD.txt', { cache: 'no-store' })
+      .then(r => r.ok ? r.text() : Promise.reject(r.status))
+      .then(t => { document.getElementById('build').textContent = t.trim(); })
+      .catch(() => { document.getElementById('build').textContent = 'BUILD.txt not found'; });
+  </script>
+</body>
+</html>
