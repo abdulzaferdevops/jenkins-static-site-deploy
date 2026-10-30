@@ -65,6 +65,18 @@ Switching releases is a symlink rename (`mv -T`), so visitors never see a half-c
 
 Jenkins → this job → **Build with Parameters** → `ACTION = rollback`. Each run steps back one release.
 
+## Results
+
+![Jenkins stage view: deploys and a rollback](docs/pipeline.png)
+
+| Build | Trigger | Outcome |
+|:--|:--|:--|
+| #2 | Manual | First release deployed and verified |
+| #3 | GitHub push (webhook) | New release deployed automatically and verified |
+| #4 | Manual, `ACTION=rollback` | Switched back to the previous release |
+
+![Deployed site showing the live release](docs/site.png)
+
 ## Licence
 
 MIT
