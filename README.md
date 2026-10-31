@@ -1,84 +1,91 @@
-# jenkins-static-site-deploy
+# jenkins-shared-library
 
-Static site CI/CD on Oracle Cloud Infrastructure: a push to `main` triggers a Jenkins pipeline
-through a GitHub webhook, which validates and packages the site, uploads it as a new release,
-switches it live atomically, and checks it is serving. If the check fails, it rolls back on its own.
+The shared Jenkins pipeline library (`ci-labs`) behind a series of CI/CD labs on Oracle Cloud
+Infrastructure. Steps that were copied into every Jenkinsfile — preflight checks, release naming,
+SSH to the app server, image-reference validation and "skip deploy for docs-only changes" — live
+here once, versioned by tag and covered by tests.
 
-Lab 1 of a series of CI/CD labs on OCI (GitHub · Jenkins · Docker · Oracle Linux app server).
+Lab 6 of the series. First consumer:
+[Lab 1, jenkins-static-site-deploy](https://github.com/abdulzaferdevops/jenkins-static-site-deploy).
 
-## Architecture
+## Using it
 
-```mermaid
-flowchart LR
-  dev[Developer] -->|git push| gh[GitHub]
-  gh -->|webhook| j[Jenkins in Docker<br/>OCI compute]
-  j -->|SSH as deploy<br/>lab subnet only| app[App server<br/>Oracle Linux 9]
-  app --> ng[nginx :8083<br/>serves current]
+```groovy
+@Library('ci-labs@v1.0.0') _
+
+pipeline {
+  agent any
+  stages {
+    stage('Preflight') {
+      steps {
+        script {
+          labPreflight(vars: ['APP_HOST'])
+          env.RELEASE = labRelease()                 // e.g. 00012-3f2a9c1
+          env.SKIP_DEPLOY = labDocsOnly() ? 'true' : 'false'
+        }
+      }
+    }
+    stage('Deploy') {
+      when { expression { env.SKIP_DEPLOY != 'true' } }
+      steps {
+        script { labSsh(script: 'scripts/release.sh', args: ['deploy', env.RELEASE]) }
+      }
+    }
+  }
+}
 ```
 
-## Pipeline
+Pipelines pin a **tag**, never `main`: a library change cannot alter a working pipeline until
+that pipeline is deliberately moved to the new version.
 
-| Stage | What it does |
+## Steps
+
+| Step | What it does |
 |:--|:--|
-| Preflight | Checks `APP_HOST` is set, names the release `<build>-<commit>`, tests the SSH connection |
-| Validate | `index.html` exists and has a title; blocks the build if a private key is committed |
-| Package | Copies the site, writes `BUILD.txt` (release, commit, build time), creates a tarball |
-| Deploy | Streams the tarball into `releases/<release>`, then switches `current` atomically |
-| Verify | Fetches `BUILD.txt` through nginx until it shows the new release; rolls back if not |
-| Rollback | Manual: run the job with `ACTION=rollback` to return to the previous release |
+| `labPreflight(vars: [...], docker: bool)` | Fails fast if a required Jenkins global variable is missing, or Docker is unavailable |
+| `labRelease()` | Release name `<build, 5 digits>-<short commit>`, sortable by build order |
+| `labDocsOnly()` | `true` if every file changed since the last successful build is documentation; anything uncertain returns `false` (deploy) |
+| `labImageRef(repo:, ref:)` | Fails unless `ref` is `<repo>@sha256:<64 lowercase hex>`; refuses tags, other registries and look-alike repository names |
+| `labSsh(command: / script:, args:, stdin:, returnStdout:)` | Runs on the app server as `deploy` with `BatchMode=yes`; quotes every argument for **both** the local and the remote shell |
+| `labShellQuote(value)` | Single-quotes a value for `/bin/sh` |
 
-## Release layout on the app server
+## Design
 
-```
-/var/www/static-site/
-├── current -> releases/00007-3f2a9c1    # what nginx serves
-└── releases/
-    ├── 00005-91bd0e4
-    ├── 00006-c03e7aa
-    └── 00007-3f2a9c1                     # newest five are kept
-```
+- **Logic in shell, wiring in Groovy.** The decisions (`docs_only.sh`, `image_ref.sh`) are plain bash in
+  `resources/lab/`, loaded with `libraryResource`, so they can be tested without a Jenkins instance.
+- **Safe defaults.** First build, rewritten history or a manual rebuild of the same commit all count as
+  code changes, so uncertainty means "deploy", never "skip".
+- **Quoting tested against hostile input.** `ssh` re-parses its arguments on the server; `labSsh` quotes
+  twice so values with quotes, `$`, spaces, globs or `$(...)` arrive literally. Found by testing an earlier
+  version, which quoted only once.
 
-Switching releases is a symlink rename (`mv -T`), so visitors never see a half-copied site.
+## Tests
 
-## Security choices
+`bash tests/run.sh` — 20 cases using only bash and git:
 
-- **Dedicated `deploy` user**, password login locked, no sudo.
-- **The deploy key works only from the lab subnet**: `from="10.0.0.0/24"` in `authorized_keys`,
-  plus no port, agent or X11 forwarding and no terminal.
-- **Host key pinned** in Jenkins `known_hosts`; `BatchMode=yes` means an unknown host fails the build
-  instead of prompting.
-- **No secrets in the repo.** The SSH key is a Jenkins credential, the server address is a Jenkins
-  global variable, and the pipeline refuses to deploy if a private key is committed.
+- `docs_only.sh`: README-only, `docs/` folder, nested `*.md`, code + docs together, a file merely *named*
+  like Markdown, first build, unknown commit, manual rebuild, rewritten history.
+- `image_ref.sh`: valid digest; tag; other registry; other repository; `repo-evil` look-alike prefix;
+  truncated, uppercase and ellipsis-shortened digests; missing arguments.
 
-## Set-up
+Each check was also verified to fail when the helper is deliberately broken (mutation testing).
+The library's own pipeline runs the tests and ShellCheck on every push.
 
-1. On the app server: create the `deploy` user, release folders and an nginx site on port 8083.
-2. In Jenkins:
-   - Credential `app-server-deploy` (SSH username with private key, username `deploy`).
-   - Global environment variable `APP_HOST` = the app server's private IP.
-   - The app server's host key added to the Jenkins user's `~/.ssh/known_hosts`
-     (verify its fingerprint against the server).
-3. Create a Pipeline job → *Pipeline script from SCM* → this repository → branch `main`.
-4. Add a GitHub webhook to `http://<jenkins>:8080/github-webhook/` (content type `application/json`).
+## Versions
 
-## Rolling back
-
-Jenkins → this job → **Build with Parameters** → `ACTION = rollback`. Each run steps back one release.
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Results
 
-![Jenkins stage view: deploys and a rollback](docs/pipeline.png)
-
-| Build | Trigger | Outcome |
+| Build | Change | Outcome |
 |:--|:--|:--|
-| #2 | Manual | First release deployed and verified |
-| #3 | GitHub push (webhook) | New release deployed automatically and verified |
-| #4 | Manual, `ACTION=rollback` | Switched back to the previous release |
+| Library CI #1 | `v1.0.0` | 20/20 shell tests passed, ShellCheck clean, layout check passed |
+| Lab 1 #6 | `Jenkinsfile` | `code changed` → deployed and verified `00006-e13d6d8` |
+| Lab 1 #7 | `README.md` only | `only documentation changed` → deploy **skipped** |
 
-![Deployed site showing the live release](docs/site.png)
+Testing found and fixed a real defect before release: the first `labSsh` quoted arguments only for the
+local shell, so a value containing `$(...)` would have run on the server.
 
 ## Licence
 
 MIT
-
-Built with the [ci-labs shared library](https://github.com/abdulzaferdevops/jenkins-shared-library).
