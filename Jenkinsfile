@@ -1,11 +1,9 @@
-// Lab 1: jenkins-static-site-deploy
+// Lab 1: jenkins-static-site-deploy - now using the ci-labs shared library (Lab 6).
 // GitHub push -> Jenkins -> validate -> package -> upload release -> atomic symlink switch
 // -> verify live release (automatic rollback if verification fails).
-//
-// One-time Jenkins setup (see README):
-//   - Credential  'app-server-deploy'  (SSH username with private key, user 'deploy')
-//   - Global environment variable  APP_HOST  = private IP of the app server
-//   - App server host key in the Jenkins user's ~/.ssh/known_hosts
+// Documentation-only changes (README, docs/, *.md) skip the deploy unless FORCE_DEPLOY is ticked.
+
+@Library('ci-labs@v1.0.0') _
 
 pipeline {
   agent any
@@ -23,37 +21,35 @@ pipeline {
   parameters {
     choice(name: 'ACTION', choices: ['deploy', 'rollback'],
            description: 'deploy = release this commit; rollback = switch back to the previous release')
+    booleanParam(name: 'FORCE_DEPLOY', defaultValue: false,
+                 description: 'Deploy even if only documentation changed')
   }
 
   environment {
     SITE_ROOT     = '/var/www/static-site'
     SITE_PORT     = '8083'
     KEEP_RELEASES = '5'
-    SSH_OPTS      = '-o BatchMode=yes -o ConnectTimeout=10'
   }
 
   stages {
     stage('Preflight') {
       steps {
         script {
-          if (!env.APP_HOST?.trim()) {
-            error('APP_HOST is not set: Manage Jenkins > System > Global properties > Environment variables')
-          }
-          env.RELEASE = sh(
-            script: 'printf "%05d-%s" "$BUILD_NUMBER" "$(echo "${GIT_COMMIT:-manual}" | cut -c1-7)"',
-            returnStdout: true
-          ).trim()
-          currentBuild.displayName = "#${env.BUILD_NUMBER} ${params.ACTION}"
-          currentBuild.description = (params.ACTION == 'deploy') ? "release ${env.RELEASE}" : 'rollback'
-        }
-        sshagent(credentials: ['app-server-deploy']) {
-          sh '''ssh $SSH_OPTS deploy@$APP_HOST 'echo "connected to $(hostname -s) as $(whoami)"' '''
+          labPreflight(vars: ['APP_HOST'])
+          env.RELEASE = labRelease()
+          String action = params.ACTION ?: 'deploy'
+          boolean docsOnly = action == 'deploy' && !params.FORCE_DEPLOY && labDocsOnly()
+          env.DO_DEPLOY = (action == 'deploy' && !docsOnly) ? 'true' : 'false'
+          currentBuild.displayName = "#${env.BUILD_NUMBER} ${docsOnly ? 'docs-only' : action}"
+          currentBuild.description = docsOnly ? 'documentation change: deploy skipped'
+                                   : (action == 'deploy' ? "release ${env.RELEASE}" : 'rollback')
+          labSsh(command: 'echo "connected to $(hostname -s) as $(whoami)"')
         }
       }
     }
 
     stage('Validate') {
-      when { expression { params.ACTION == 'deploy' } }
+      when { expression { env.DO_DEPLOY == 'true' } }
       steps {
         sh '''
           test -s site/index.html || { echo "site/index.html is missing"; exit 1; }
@@ -68,7 +64,7 @@ pipeline {
     }
 
     stage('Package') {
-      when { expression { params.ACTION == 'deploy' } }
+      when { expression { env.DO_DEPLOY == 'true' } }
       steps {
         sh '''
           rm -rf build release.tgz
@@ -86,42 +82,47 @@ pipeline {
     }
 
     stage('Deploy') {
-      when { expression { params.ACTION == 'deploy' } }
+      when { expression { env.DO_DEPLOY == 'true' } }
       steps {
-        sshagent(credentials: ['app-server-deploy']) {
-          sh '''
-            ssh $SSH_OPTS deploy@$APP_HOST "mkdir -p $SITE_ROOT/releases/$RELEASE && tar -xzf - -C $SITE_ROOT/releases/$RELEASE" < release.tgz
-            ssh $SSH_OPTS deploy@$APP_HOST bash -s -- "$SITE_ROOT" "$RELEASE" "$KEEP_RELEASES" < scripts/activate_release.sh
-          '''
+        script {
+          String dir = "${env.SITE_ROOT}/releases/${env.RELEASE}"
+          labSsh(command: "mkdir -p ${labShellQuote(dir)} && tar -xzf - -C ${labShellQuote(dir)}",
+                 stdin: 'release.tgz', label: 'upload release')
+          labSsh(script: 'scripts/activate_release.sh',
+                 args: [env.SITE_ROOT, env.RELEASE, env.KEEP_RELEASES], label: 'activate release')
         }
       }
     }
 
     stage('Verify') {
-      when { expression { params.ACTION == 'deploy' } }
+      when { expression { env.DO_DEPLOY == 'true' } }
       steps {
-        sshagent(credentials: ['app-server-deploy']) {
-          sh '''
-            for attempt in 1 2 3 4 5; do
-              if ssh $SSH_OPTS deploy@$APP_HOST "curl -fsS http://localhost:$SITE_PORT/BUILD.txt" | grep -qx "release=$RELEASE"; then
-                echo "verified: release $RELEASE is live on port $SITE_PORT"
-                exit 0
-              fi
-              sleep 2
-            done
-            echo "verification FAILED - rolling back to the previous release"
-            ssh $SSH_OPTS deploy@$APP_HOST bash -s -- "$SITE_ROOT" < scripts/rollback_release.sh
-            exit 1
-          '''
+        script {
+          String expected = "release=${env.RELEASE}"
+          boolean live = false
+          for (int attempt = 1; attempt <= 5 && !live; attempt++) {
+            String body = labSsh(command: "curl -fsS http://localhost:${env.SITE_PORT}/BUILD.txt || true",
+                                 returnStdout: true, label: "verify attempt ${attempt}")
+            live = ("\n" + body + "\n").contains("\n" + expected + "\n")
+            if (!live) {
+              sleep(time: 2, unit: 'SECONDS')
+            }
+          }
+          if (!live) {
+            echo 'verification FAILED - rolling back to the previous release'
+            labSsh(script: 'scripts/rollback_release.sh', args: [env.SITE_ROOT], label: 'automatic rollback')
+            error("release ${env.RELEASE} did not go live")
+          }
+          echo "verified: release ${env.RELEASE} is live on port ${env.SITE_PORT}"
         }
       }
     }
 
     stage('Rollback') {
-      when { expression { params.ACTION == 'rollback' } }
+      when { expression { (params.ACTION ?: 'deploy') == 'rollback' } }
       steps {
-        sshagent(credentials: ['app-server-deploy']) {
-          sh 'ssh $SSH_OPTS deploy@$APP_HOST bash -s -- "$SITE_ROOT" < scripts/rollback_release.sh'
+        script {
+          labSsh(script: 'scripts/rollback_release.sh', args: [env.SITE_ROOT], label: 'rollback')
         }
       }
     }
