@@ -80,3 +80,5 @@ Jenkins → this job → **Build with Parameters** → `ACTION = rollback`. Each
 ## Licence
 
 MIT
+
+Built with the [ci-labs shared library](https://github.com/abdulzaferdevops/jenkins-shared-library).
